@@ -14,6 +14,7 @@
 
 """A minimal ROS 2 driver for Boston Dynamics Spot robot."""
 
+import threading
 import time
 from typing import Optional
 
@@ -26,12 +27,13 @@ from bosdyn.client.frame_helpers import GRAV_ALIGNED_BODY_FRAME_NAME, ODOM_FRAME
 from bosdyn.client.lease import Error as LeaseError
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_stand
-from bosdyn.client.robot_state import RobotStateClient
+from bosdyn.client.robot_state import RobotStateClient, RobotStateStreamingClient
 
 from geometry_msgs.msg import TransformStamped, Twist
 
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 
 from tf2_ros import TransformBroadcaster
 
@@ -47,6 +49,9 @@ class SpotROS2Driver(Node):
         self.hostname = self.get_parameter('hostname').get_parameter_value().string_value
         # TODO: Add parameter for robot username and password if needed
 
+        self._latest_state = None
+        self._state_lock = threading.Lock()
+
         self.robot: Optional[bosdyn.client.robot.Robot] = None
         self.lease_keep_alive: Optional[LeaseKeepAlive] = None
         self.estop_keep_alive: Optional[EstopKeepAlive] = None
@@ -56,6 +61,10 @@ class SpotROS2Driver(Node):
         try:
             # Robot initialization
             sdk = bosdyn.client.create_standard_sdk('SpotROS2DriverClient')
+            # Register the non-standard api clients
+            # https://github.com/boston-dynamics/spot-sdk/blob/master/python/examples/joint_control/noarm_squat.py
+            sdk.register_service_client(RobotStateStreamingClient)
+
             self.robot = sdk.create_robot(self.hostname)
             bosdyn.client.util.authenticate(self.robot)
             self.robot.time_sync.wait_for_sync()
@@ -68,6 +77,7 @@ class SpotROS2Driver(Node):
 
             # Create SDK clients
             self.robot_state_client = self.robot.ensure_client(RobotStateClient.default_service_name)
+            self.robot_state_streaming_client = self.robot.ensure_client(RobotStateStreamingClient.default_service_name)
             self.command_client = self.robot.ensure_client(RobotCommandClient.default_service_name)
             lease_client = self.robot.ensure_client(LeaseClient.default_service_name)
             estop_client = self.robot.ensure_client(EstopClient.default_service_name)
@@ -83,7 +93,7 @@ class SpotROS2Driver(Node):
             self.estop_keep_alive = EstopKeepAlive(estop_endpoint)
             self.get_logger().info('Acquired E-Stop.')
 
-            time.sleep(1.0)
+            time.sleep(2.0)
 
             # Power on and Stand Robot
             self.robot.power_on(timeout_sec=20)
@@ -101,15 +111,35 @@ class SpotROS2Driver(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
         self.cmd_vel_subscriber = self.create_subscription(Twist, 'cmd_vel', self.cmd_vel_callback, 10)
 
+        # Start the background thread for state streaming
+        self._state_thread = threading.Thread(target=self._state_streaming_thread, daemon=True)
+        self._state_thread.start()
+
         # Main Loop
         self.timer = self.create_timer(0.1, self.timer_callback)
 
+    def _state_streaming_thread(self):
+        """Continuously gets robot state and caches it thread-safely."""
+        try:
+            for robot_state in self.robot_state_streaming_client.get_robot_state_stream():
+                with self._state_lock:
+                    self.get_logger().info(f"Received object of type: {type(robot_state)}")
+                    self._latest_state = robot_state
+        except Exception as e:
+            self.get_logger().error(f'Error in state streaming thread: {e}')
+
     def timer_callback(self):
         """Periodic publish robot data (if connected)."""
-        robot_state = self.robot_state_client.get_robot_state()
-        odom_tfrom_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
-                                        ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
-        self.publish_transform(odom_tfrom_body)
+        with self._state_lock:
+            robot_state = self._latest_state
+
+        if robot_state:
+            odom_tfrom_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+                                            ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+            self.publish_transform(odom_tfrom_body)
+        # robot_state = self.robot_state_client.get_robot_state()
+        # odom_tfrom_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+        # self.publish_transform(odom_tfrom_body)
 
     def publish_transform(self, odom_tfrom_body: SE3Pose):  # type: ignore
         """Publish the transform from ODOM to BODY frame."""
